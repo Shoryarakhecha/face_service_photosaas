@@ -1,0 +1,13 @@
+# render.yaml
+# Blueprint for one-click deployment of the face recognition service.
+# Render will detect this file automatically when you connect the repo.
+
+services:
+  - type: web
+    name: photosaas-face-service
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "*"  # tighten this to your Vercel domain once deployed
