@@ -1,20 +1,8 @@
 # app/main.py
-# Face recognition microservice using InsightFace.
-# Two endpoints:
-#   POST /extract-embeddings  — given an image URL, detect all faces and
-#                                return one embedding vector per face
-#   POST /compare             — given one selfie embedding and a list of
-#                                photo embeddings, return matches above a
-#                                similarity threshold
-#
-# Stateless by design — Next.js owns all storage (Postgres). This service
-# only does the ML work and never persists anything itself.
-
 import os
-import io
 import time
 import logging
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import requests
@@ -30,8 +18,6 @@ logger = logging.getLogger("face-service")
 
 app = FastAPI(title="PhotoSaaS Face Recognition Service")
 
-# Allow requests from your Next.js app. In production, replace "*" with
-# your actual Vercel domain to avoid the API being callable from anywhere.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
@@ -40,21 +26,24 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────
-# MODEL LOADING (happens once at startup — this is the slow part on cold start)
+# MODEL LOADING (lazy — loads on first request, not at startup)
+# Using buffalo_sc (small/compact) instead of buffalo_l to stay within
+# Render free tier's 512MB RAM limit.
 # ─────────────────────────────────────────
-face_app: FaceAnalysis | None = None
+_face_app: Optional[FaceAnalysis] = None
 
 
-@app.on_event("startup")
-def load_model():
-    global face_app
-    logger.info("Loading InsightFace model (buffalo_l)...")
-    start = time.time()
-    # buffalo_l = the standard accurate model bundle (detection + recognition).
-    # ctx_id=-1 forces CPU mode, since Render's free tier has no GPU.
-    face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-    face_app.prepare(ctx_id=-1, det_size=(640, 640))
-    logger.info(f"Model loaded in {time.time() - start:.1f}s")
+def get_face_app() -> FaceAnalysis:
+    """Load the model once and reuse it for all subsequent requests."""
+    global _face_app
+    if _face_app is None:
+        logger.info("Loading InsightFace model (buffalo_sc)...")
+        start = time.time()
+        fa = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
+        fa.prepare(ctx_id=-1, det_size=(320, 320))
+        _face_app = fa
+        logger.info(f"Model loaded in {time.time() - start:.1f}s")
+    return _face_app
 
 
 # ─────────────────────────────────────────
@@ -66,7 +55,7 @@ class ExtractRequest(BaseModel):
 
 class FaceEmbedding(BaseModel):
     embedding: List[float]
-    bbox: List[float]  # [x1, y1, x2, y2] — useful later for face-crop thumbnails
+    bbox: List[float]
     confidence: float
 
 
@@ -76,9 +65,8 @@ class ExtractResponse(BaseModel):
 
 class CompareRequest(BaseModel):
     selfie_embedding: List[float]
-    # photo_id -> list of face embeddings detected in that photo
     candidates: dict[str, List[List[float]]]
-    threshold: float = 0.45  # cosine similarity threshold; tuned conservatively
+    threshold: float = 0.45
 
 
 class CompareResponse(BaseModel):
@@ -114,16 +102,14 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 # ─────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": face_app is not None}
+    return {"status": "ok", "model_loaded": _face_app is not None}
 
 
 @app.post("/extract-embeddings", response_model=ExtractResponse)
 def extract_embeddings(req: ExtractRequest):
-    if face_app is None:
-        raise HTTPException(status_code=503, detail="Model still loading, try again shortly")
-
+    fa = get_face_app()
     img = download_image(req.image_url)
-    faces = face_app.get(img)
+    faces = fa.get(img)
 
     results = [
         FaceEmbedding(
@@ -133,7 +119,6 @@ def extract_embeddings(req: ExtractRequest):
         )
         for face in faces
     ]
-
     return ExtractResponse(faces=results)
 
 
@@ -153,7 +138,5 @@ def compare(req: CompareRequest):
             matched_ids.append(photo_id)
             scores[photo_id] = round(best_score, 4)
 
-    # Sort matches by score, best first
     matched_ids.sort(key=lambda pid: scores[pid], reverse=True)
-
     return CompareResponse(matched_photo_ids=matched_ids, scores=scores)
